@@ -15,6 +15,7 @@ path = "src/bin/main.rs"
 
 [dependencies]
 jbindgen-annotations = { version = "=0.1.0", path = "../annotations" }
+jni = { workspace = true, features = ["invocation"] }
 
 log.workspace = true
 pretty_env_logger = "0.5"
@@ -22,7 +23,6 @@ cafebabe.workspace = true
 thiserror.workspace = true
 clap = { version = "4", features = ["derive"] }
 zip = "7"
-jni = { workspace = true, features = ["invocation"] }
 
 [build-dependencies]
 javac.workspace = true
