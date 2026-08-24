@@ -359,7 +359,7 @@ fn render_field(
         }
         body_buffer.push_str(&format!("            sig = {},\n", rust_type));
         // By explicitly specifying the getter name, we avoid generating a setter for final fields
-        if field.is_final || field.get.is_some() {
+        if field.is_final || field.get.is_some() || field.set.is_some() {
             body_buffer.push_str(&format!(
                 "            get = {},\n",
                 field.get.unwrap_or(rust_name)
