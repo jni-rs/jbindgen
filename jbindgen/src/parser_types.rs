@@ -111,4 +111,8 @@ pub struct FieldInfo {
     pub is_final: bool,
     /// Whether this field is marked as deprecated
     pub is_deprecated: bool,
+    /// Optional Rust getter override
+    pub get: Option<String>,
+    /// Optional Rust setter override
+    pub set: Option<String>,
 }

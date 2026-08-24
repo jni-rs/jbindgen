@@ -492,5 +492,7 @@ fn java_to_field_info(
         is_static,
         is_final,
         is_deprecated,
+        get: None,
+        set: None,
     })
 }

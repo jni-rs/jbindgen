@@ -771,6 +771,8 @@ mod tests {
             is_static: true,
             is_final: true,
             is_deprecated: false,
+            get: None,
+            set: None,
         };
 
         let sig = field_to_dex_signature("android/os/Build", &field);
