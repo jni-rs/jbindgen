@@ -542,6 +542,9 @@ pub fn generate_with_type_map(
     // Buffer for constructors, methods, fields, etc.
     let mut body_buffer = String::new();
 
+    // Track names of methods for accessor collision detection
+    let mut method_final_names = Vec::new();
+
     // Generate constructors block if any
     if !class_info.constructors.is_empty() {
         // Filter out constructors based on skip_signatures
@@ -592,6 +595,8 @@ pub fn generate_with_type_map(
                 } else {
                     &ctor_names[idx]
                 };
+
+                method_final_names.push(ctor_name.to_string());
 
                 let sig = generate_method_signature_with_deps(
                     ctor,
@@ -710,9 +715,6 @@ pub fn generate_with_type_map(
         .collect();
 
     let fields_idx = body_buffer.len();
-
-    // Track names of methods for accessor collision detection
-    let mut method_final_names = Vec::new();
 
     // Generate methods block if any
     // When generate_native_interfaces is false, public native methods also go here
