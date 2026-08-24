@@ -1,5 +1,6 @@
 //! Code generator for Rust bindings
 
+use crate::FieldInfo;
 use crate::error::{Error, Result};
 use crate::parser_types::{ClassInfo, MethodInfo};
 use std::collections::{HashMap, HashSet};
@@ -316,6 +317,81 @@ impl Default for TypeMap {
     }
 }
 
+/// Write a field into a buffer
+fn render_field(
+    field: FieldInfo,
+    body_buffer: &mut String,
+    rust_name: String,
+    rust_type: String,
+    needs_explicit_name: bool,
+) {
+    // Add field documentation if available
+    if let Some(doc) = &field.documentation {
+        if !doc.is_empty() {
+            for line in format_javadoc_as_rustdoc(doc).lines() {
+                body_buffer.push_str("        ");
+                body_buffer.push_str(line);
+                body_buffer.push('\n');
+            }
+        }
+    }
+
+    // Add #[deprecated] attribute if needed
+    if field.is_deprecated {
+        body_buffer.push_str("        #[deprecated]\n");
+    }
+
+    // Add #[allow(non_snake_case)] if the name is not snake_case
+    if !is_snake_case(&rust_name) {
+        body_buffer.push_str("        #[allow(non_snake_case)]\n");
+    }
+
+    let modifier = if field.is_static { "static " } else { "" };
+
+    let use_props =
+        needs_explicit_name || field.is_final || field.get.is_some() || field.set.is_some();
+
+    if use_props {
+        // Use property syntax when name isn't reversible or field is final
+        body_buffer.push_str(&format!("        {}{} {{\n", modifier, rust_name));
+        if needs_explicit_name {
+            body_buffer.push_str(&format!("            name = \"{}\",\n", field.name));
+        }
+        body_buffer.push_str(&format!("            sig = {},\n", rust_type));
+        // By explicitly specifying the getter name, we avoid generating a setter for final fields
+        if field.is_final || field.get.is_some() || field.set.is_some() {
+            body_buffer.push_str(&format!(
+                "            get = {},\n",
+                field.get.unwrap_or(rust_name)
+            ));
+        }
+
+        if let Some(set) = field.set
+            && !field.is_final
+        {
+            body_buffer.push_str(&format!("            set = {},\n", set));
+        }
+
+        body_buffer.push_str("        },\n");
+    } else {
+        // Use shorthand syntax when name is reversible
+        body_buffer.push_str(&format!("        {}{}: {}", modifier, rust_name, rust_type));
+        body_buffer.push_str(",\n");
+    }
+}
+
+#[derive(Clone)]
+enum Accessor {
+    Getter(String),
+    Setter(String),
+}
+
+struct GeneratedField {
+    field: FieldInfo,
+    is_reversible: bool,
+    rust_name: String,
+}
+
 /// Convert Javadoc comment to Rustdoc format
 ///
 /// This takes a Javadoc comment string and converts it to Rustdoc format.
@@ -466,6 +542,9 @@ pub fn generate_with_type_map(
     // Buffer for constructors, methods, fields, etc.
     let mut body_buffer = String::new();
 
+    // Track names of methods for accessor collision detection
+    let mut method_final_names = Vec::new();
+
     // Generate constructors block if any
     if !class_info.constructors.is_empty() {
         // Filter out constructors based on skip_signatures
@@ -517,6 +596,8 @@ pub fn generate_with_type_map(
                     &ctor_names[idx]
                 };
 
+                method_final_names.push(ctor_name.to_string());
+
                 let sig = generate_method_signature_with_deps(
                     ctor,
                     type_map,
@@ -553,122 +634,87 @@ pub fn generate_with_type_map(
         }
     }
 
-    // Generate fields block if any
-    if !class_info.fields.is_empty() {
-        // Filter out fields based on skip_signatures
-        let mut fields_to_emit = class_info.fields.clone();
-        if !options.skip_signatures.is_empty() {
-            fields_to_emit.retain(|field| {
-                let dex_sig = generate_field_dex_signature(&class_info.class_name, field);
-                !options.skip_signatures.contains(&dex_sig)
-            });
-        }
+    // Filter out fields based on skip_signatures
+    let mut fields_to_emit: Vec<_> = class_info
+        .fields
+        .clone()
+        .into_iter()
+        .map(|field| GeneratedField {
+            field,
+            is_reversible: false,
+            rust_name: String::new(),
+        })
+        .collect();
+    if !options.skip_signatures.is_empty() {
+        fields_to_emit.retain(|GeneratedField { field, .. }| {
+            let dex_sig = generate_field_dex_signature(&class_info.class_name, field);
+            !options.skip_signatures.contains(&dex_sig)
+        });
+    }
 
-        if !fields_to_emit.is_empty() {
-            body_buffer.push_str("    fields {\n");
+    // Track used Rust names to detect collisions
+    let mut field_names: HashSet<(String, String)> = HashSet::new();
 
-            // Track used Rust names to detect collisions
-            let mut field_names: HashSet<(String, String)> = HashSet::new();
+    // Generate getter / setter -> field lookup
+    let accessor_names: Vec<(Accessor, usize)> = fields_to_emit
+        .iter_mut()
+        .enumerate()
+        .flat_map(|(idx, GeneratedField { field, is_reversible, rust_name })| {
+            // Check if there's a name override for this field
+            let dex_sig = generate_field_dex_signature(&class_info.class_name, field);
+            let overridden_name = options.name_overrides.get(&dex_sig);
 
-            for field in &fields_to_emit {
-                // Check if there's a name override for this field
-                let dex_sig = generate_field_dex_signature(&class_info.class_name, field);
-                let overridden_name = options.name_overrides.get(&dex_sig);
+            (*rust_name, *is_reversible) = if let Some(override_name) = overridden_name {
+                // Priority 1: Use the CLI/config overridden name
+                (override_name.clone(), false)
+            } else if let Some(override_name) = field.rust_name_override.as_ref() {
+                // Priority 2: Use @RustName annotation from source
+                (override_name.clone(), false)
+            } else {
+                // Priority 3: Derive from Java name
+                java_name_to_rust(&field.name)
+            };
 
-                let (mut rust_name, mut is_reversible) =
-                    if let Some(override_name) = overridden_name {
-                        // Priority 1: Use the CLI/config overridden name
-                        (override_name.clone(), false)
-                    } else if let Some(override_name) = field.rust_name_override.as_ref() {
-                        // Priority 2: Use @RustName annotation from source
-                        (override_name.clone(), false)
-                    } else {
-                        // Priority 3: Derive from Java name
-                        java_name_to_rust(&field.name)
-                    };
+            // Check for name collisions and resolve them
+            let (final_rust_name, had_collision, conflicting_java_name) =
+                resolve_name_collision(rust_name.clone(), &field.name, &mut field_names);
 
-                // Check for name collisions and resolve them
-                let (final_rust_name, had_collision, conflicting_java_name) =
-                    resolve_name_collision(rust_name.clone(), &field.name, &mut field_names);
-
-                if had_collision {
-                    log::warn!(
-                        "Field name collision detected in class '{}':\n  \
+            if had_collision {
+                log::warn!(
+                    "Field name collision detected in class '{}':\n  \
                          Java field '{}' maps to Rust name '{}' which conflicts with field '{}'.\n  \
                          Using '{}' instead.\n  \
                          To customize this name, use:\n  \
                          - skip_signatures option with DEX signature: {}\n  \
                          - name_overrides option: map[{:?}] = \"your_name\"\n  \
                          - CLI: --skip '{}' or --name '{}=your_name'",
-                        class_info.class_name,
-                        field.name,
-                        rust_name,
-                        conflicting_java_name.unwrap_or_default(),
-                        final_rust_name,
-                        dex_sig,
-                        dex_sig,
-                        dex_sig,
-                        dex_sig
-                    );
-                    rust_name = final_rust_name;
-                    is_reversible = false; // Collisions are never reversible
-                } else {
-                    rust_name = final_rust_name;
-                }
-
-                let rust_type =
-                    resolve_type_with_deps(&field.type_info, type_map, &mut used_types)?;
-                let needs_explicit_name = !is_reversible;
-
-                // Add field documentation if available
-                if let Some(doc) = &field.documentation {
-                    if !doc.is_empty() {
-                        for line in format_javadoc_as_rustdoc(doc).lines() {
-                            body_buffer.push_str("        ");
-                            body_buffer.push_str(line);
-                            body_buffer.push('\n');
-                        }
-                    }
-                }
-
-                // Add #[deprecated] attribute if needed
-                if field.is_deprecated {
-                    body_buffer.push_str("        #[deprecated]\n");
-                }
-
-                // Add #[allow(non_snake_case)] if the name is not snake_case
-                if !is_snake_case(&rust_name) {
-                    body_buffer.push_str("        #[allow(non_snake_case)]\n");
-                }
-
-                let modifier = if field.is_static { "static " } else { "" };
-
-                let use_props = needs_explicit_name || field.is_final;
-
-                if use_props {
-                    // Use property syntax when name isn't reversible or field is final
-                    body_buffer.push_str(&format!("        {}{} {{\n", modifier, rust_name));
-                    if needs_explicit_name {
-                        body_buffer.push_str(&format!("            name = \"{}\",\n", field.name));
-                    }
-                    body_buffer.push_str(&format!("            sig = {},\n", rust_type));
-                    // By explicitly specifying the getter name, we avoid generating a setter for final fields
-                    if field.is_final {
-                        body_buffer.push_str(&format!("            get = {},\n", rust_name));
-                    }
-
-                    body_buffer.push_str("        },\n");
-                } else {
-                    // Use shorthand syntax when name is reversible
-                    body_buffer
-                        .push_str(&format!("        {}{}: {}", modifier, rust_name, rust_type));
-                    body_buffer.push_str(",\n");
-                }
+                    class_info.class_name,
+                    field.name,
+                    rust_name,
+                    conflicting_java_name.unwrap_or_default(),
+                    final_rust_name,
+                    dex_sig,
+                    dex_sig,
+                    dex_sig,
+                    dex_sig
+                );
+                *rust_name = final_rust_name;
+                *is_reversible = false; // Collisions are never reversible
+            } else {
+                *rust_name = final_rust_name;
             }
 
-            body_buffer.push_str("    },\n");
-        }
-    }
+            let mut accessors = vec![(Accessor::Getter(rust_name.clone()), idx)];
+
+            if !field.is_final {
+                accessors.push((Accessor::Setter(format!("set_{}", rust_name)), idx));
+            }
+
+            accessors
+        })
+        .collect();
+
+    let fields_idx = body_buffer.len();
 
     // Generate methods block if any
     // When generate_native_interfaces is false, public native methods also go here
@@ -759,6 +805,8 @@ pub fn generate_with_type_map(
                 // Check for name collisions across different Java method names
                 let (final_rust_name, had_collision, conflicting_java_name) =
                     resolve_name_collision(rust_name.clone(), java_name, &mut all_method_names);
+
+                method_final_names.push(final_rust_name.clone());
 
                 if had_collision {
                     log::warn!(
@@ -899,6 +947,8 @@ pub fn generate_with_type_map(
                             &mut all_native_method_names,
                         );
 
+                    method_final_names.push(final_rust_name.clone());
+
                     if had_collision {
                         log::warn!(
                             "Native method name collision detected in class '{}':\n  \
@@ -955,6 +1005,100 @@ pub fn generate_with_type_map(
             body_buffer.push_str("    },\n");
         }
     }
+
+    // Check for name collisions with field accessors
+    let mut used_names: HashSet<String> = method_final_names.into_iter().collect();
+
+    for (accessor_name, idx) in accessor_names {
+        match accessor_name {
+            Accessor::Getter(mut getter) => {
+                let original_getter = getter.clone();
+
+                let mut changed = false;
+
+                while used_names.contains(&getter) {
+                    getter.push('_');
+                    changed = true;
+                }
+
+                if changed {
+                    let field = &mut fields_to_emit[idx].field;
+
+                    log::warn!(
+                        "Field accessor name collision detected in class '{}':\n  \
+                             Java field '{}' would generate a Rust getter named '{}' which conflicts with another generated member.\n  \
+                             Using '{}' instead.",
+                        class_info.class_name,
+                        field.name,
+                        original_getter,
+                        getter,
+                    );
+
+                    field.get = Some(getter.clone());
+                }
+
+                used_names.insert(getter);
+            }
+            Accessor::Setter(mut setter) => {
+                let original_setter = setter.clone();
+
+                let mut changed = false;
+
+                while used_names.contains(&setter) {
+                    setter.push('_');
+                    changed = true;
+                }
+
+                if changed {
+                    let field = &mut fields_to_emit[idx].field;
+
+                    log::warn!(
+                        "Field accessor name collision detected in class '{}':\n  \
+                             Java field '{}' would generate a Rust setter named '{}' which conflicts with another generated member.\n  \
+                             Using '{}' instead.",
+                        class_info.class_name,
+                        field.name,
+                        original_setter,
+                        setter,
+                    );
+
+                    field.set = Some(setter.clone());
+                }
+
+                used_names.insert(setter);
+            }
+        }
+    }
+
+    let mut fields_buffer = String::new();
+
+    // Generate fields block if any
+    if !fields_to_emit.is_empty() {
+        fields_buffer.push_str("    fields {\n");
+
+        for GeneratedField {
+            field,
+            is_reversible,
+            rust_name,
+        } in fields_to_emit
+        {
+            let rust_type = resolve_type_with_deps(&field.type_info, type_map, &mut used_types)?;
+            let needs_explicit_name = !is_reversible;
+
+            render_field(
+                field,
+                &mut fields_buffer,
+                rust_name,
+                rust_type,
+                needs_explicit_name,
+            );
+        }
+
+        fields_buffer.push_str("    },\n");
+    }
+
+    // Commit fields to body buffer
+    body_buffer.insert_str(fields_idx, &fields_buffer);
 
     // Generate is_instance_of block if we have any types (only those with Rust bindings)
     let instance_of_types: Vec<_> = class_info
@@ -2180,6 +2324,8 @@ mod tests {
                     is_static: false,
                     is_final: false,
                     is_deprecated: false,
+                    get: None,
+                    set: None,
                 },
                 FieldInfo {
                     name: "myVALUE".to_string(),
@@ -2189,6 +2335,8 @@ mod tests {
                     is_static: false,
                     is_final: false,
                     is_deprecated: false,
+                    get: None,
+                    set: None,
                 },
             ],
             native_methods: vec![],
@@ -2233,6 +2381,102 @@ mod tests {
         assert!(
             code.contains("my_value_ {"),
             "Should find field 'my_value_' (with underscore) for collision\nCode:\n{}",
+            code
+        );
+    }
+
+    #[test]
+    fn test_accessor_collision_detection() {
+        use crate::parser_types::{ClassInfo, FieldInfo};
+
+        let void_type = TypeInfo {
+            name: "void".to_string(),
+            array_dimensions: 0,
+            is_primitive: true,
+        };
+        let int_type = TypeInfo {
+            name: "int".to_string(),
+            array_dimensions: 0,
+            is_primitive: true,
+        };
+
+        let class_info = ClassInfo {
+            class_name: "com/example/TestClass".to_string(),
+            package: vec!["com".to_string(), "example".to_string()],
+            simple_name: "TestClass".to_string(),
+            documentation: None,
+            rust_name_override: None,
+            constructors: vec![],
+            methods: vec![
+                // First method: foo - should collide with getter
+                MethodInfo {
+                    name: "foo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    signature: MethodSignature {
+                        arguments: vec![],
+                        return_type: int_type.clone(),
+                    },
+                    is_static: false,
+                    is_constructor: false,
+                    is_native: false,
+                    is_deprecated: false,
+                    is_public: true,
+                },
+                // Second method: setFoo - should collide with setter
+                MethodInfo {
+                    name: "setFoo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    signature: MethodSignature {
+                        arguments: vec![ArgInfo {
+                            name: None,
+                            type_info: int_type.clone(),
+                            rust_primitive: None,
+                        }],
+                        return_type: void_type.clone(),
+                    },
+                    is_static: false,
+                    is_constructor: false,
+                    is_native: false,
+                    is_deprecated: false,
+                    is_public: true,
+                },
+            ],
+            fields: vec![
+                // Accessor collision test: getter and setter should collide with existing methods
+                FieldInfo {
+                    name: "foo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    type_info: int_type.clone(),
+                    is_static: false,
+                    is_final: false,
+                    is_deprecated: false,
+                    get: None,
+                    set: None,
+                },
+            ],
+            native_methods: vec![],
+            instance_of: vec![],
+        };
+
+        let options = BindgenOptions::default();
+        let type_map = TypeMap::from_classes(std::slice::from_ref(&class_info), &options);
+
+        let binding = generate_with_type_map(&class_info, &options, &type_map).unwrap();
+        let code = binding.binding_code;
+
+        // Verify that foo accessors were overwritten with underscores
+        // Both should use property syntax since getters and setters will be custom
+        assert!(
+            code.contains("get = foo_"),
+            "Should find 'get = foo_' for foo field\nCode:\n{}",
+            code
+        );
+        assert!(
+            code.contains("set = set_foo_"),
+            "Should find 'set = set_foo_' for foo field\nCode:\n{}",
             code
         );
     }

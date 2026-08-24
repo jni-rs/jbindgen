@@ -187,6 +187,8 @@ pub fn parse_class(class: &ClassFile) -> Result<ClassInfo> {
             is_static,
             is_final,
             is_deprecated: false, // Not available from bytecode
+            get: None,
+            set: None,
         };
 
         fields.push(field_info);
