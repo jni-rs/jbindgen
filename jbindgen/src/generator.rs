@@ -1012,6 +1012,8 @@ pub fn generate_with_type_map(
     for (accessor_name, idx) in accessor_names {
         match accessor_name {
             Accessor::Getter(mut getter) => {
+                let original_getter = getter.clone();
+
                 let mut changed = false;
 
                 while used_names.contains(&getter) {
@@ -1020,12 +1022,26 @@ pub fn generate_with_type_map(
                 }
 
                 if changed {
-                    fields_to_emit[idx].field.get = Some(getter.clone());
+                    let field = &mut fields_to_emit[idx].field;
+
+                    log::warn!(
+                        "Field accessor name collision detected in class '{}':\n  \
+                             Java field '{}' would generate a Rust getter named '{}' which conflicts with another generated member.\n  \
+                             Using '{}' instead.",
+                        class_info.class_name,
+                        field.name,
+                        original_getter,
+                        getter,
+                    );
+
+                    field.get = Some(getter.clone());
                 }
 
                 used_names.insert(getter);
             }
             Accessor::Setter(mut setter) => {
+                let original_setter = setter.clone();
+
                 let mut changed = false;
 
                 while used_names.contains(&setter) {
@@ -1034,7 +1050,19 @@ pub fn generate_with_type_map(
                 }
 
                 if changed {
-                    fields_to_emit[idx].field.set = Some(setter.clone());
+                    let field = &mut fields_to_emit[idx].field;
+
+                    log::warn!(
+                        "Field accessor name collision detected in class '{}':\n  \
+                             Java field '{}' would generate a Rust setter named '{}' which conflicts with another generated member.\n  \
+                             Using '{}' instead.",
+                        class_info.class_name,
+                        field.name,
+                        original_setter,
+                        setter,
+                    );
+
+                    field.set = Some(setter.clone());
                 }
 
                 used_names.insert(setter);
