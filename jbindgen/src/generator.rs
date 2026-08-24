@@ -2384,4 +2384,100 @@ mod tests {
             code
         );
     }
+
+    #[test]
+    fn test_accessor_collision_detection() {
+        use crate::parser_types::{ClassInfo, FieldInfo};
+
+        let void_type = TypeInfo {
+            name: "void".to_string(),
+            array_dimensions: 0,
+            is_primitive: true,
+        };
+        let int_type = TypeInfo {
+            name: "int".to_string(),
+            array_dimensions: 0,
+            is_primitive: true,
+        };
+
+        let class_info = ClassInfo {
+            class_name: "com/example/TestClass".to_string(),
+            package: vec!["com".to_string(), "example".to_string()],
+            simple_name: "TestClass".to_string(),
+            documentation: None,
+            rust_name_override: None,
+            constructors: vec![],
+            methods: vec![
+                // First method: foo - should collide with getter
+                MethodInfo {
+                    name: "foo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    signature: MethodSignature {
+                        arguments: vec![],
+                        return_type: int_type.clone(),
+                    },
+                    is_static: false,
+                    is_constructor: false,
+                    is_native: false,
+                    is_deprecated: false,
+                    is_public: true,
+                },
+                // Second method: setFoo - should collide with setter
+                MethodInfo {
+                    name: "setFoo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    signature: MethodSignature {
+                        arguments: vec![ArgInfo {
+                            name: None,
+                            type_info: int_type.clone(),
+                            rust_primitive: None,
+                        }],
+                        return_type: void_type.clone(),
+                    },
+                    is_static: false,
+                    is_constructor: false,
+                    is_native: false,
+                    is_deprecated: false,
+                    is_public: true,
+                },
+            ],
+            fields: vec![
+                // Accessor collision test: getter and setter should collide with existing methods
+                FieldInfo {
+                    name: "foo".to_string(),
+                    documentation: None,
+                    rust_name_override: None,
+                    type_info: int_type.clone(),
+                    is_static: false,
+                    is_final: false,
+                    is_deprecated: false,
+                    get: None,
+                    set: None,
+                },
+            ],
+            native_methods: vec![],
+            instance_of: vec![],
+        };
+
+        let options = BindgenOptions::default();
+        let type_map = TypeMap::from_classes(std::slice::from_ref(&class_info), &options);
+
+        let binding = generate_with_type_map(&class_info, &options, &type_map).unwrap();
+        let code = binding.binding_code;
+
+        // Verify that foo accessors were overwritten with underscores
+        // Both should use property syntax since getters and setters will be custom
+        assert!(
+            code.contains("get = foo_"),
+            "Should find 'get = foo_' for foo field\nCode:\n{}",
+            code
+        );
+        assert!(
+            code.contains("set = set_foo_"),
+            "Should find 'set = set_foo_' for foo field\nCode:\n{}",
+            code
+        );
+    }
 }
